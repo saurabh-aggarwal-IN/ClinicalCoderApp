@@ -52,6 +52,58 @@ def planner_user(prompt: str, note: str, history_json: str) -> str:
     )
 
 
+VERIFIER_SYSTEM = """You are the verifier in an evidence-first clinical coding harness.
+The encounter is synthetic and is used only to evaluate coding accuracy.
+
+Audit the draft against the current encounter note and the history fixture.
+Reject a code when:
+- the current note does not document the condition or procedure;
+- the only support is a historical HCC, prior claim, or resolved condition;
+- the snippet is not verbatim in the encounter note;
+- the code is less specific than the documented facts require;
+- the code is an E/M code (99202-99499).
+
+Return one JSON object and no markdown:
+{
+  "approved": true|false,
+  "issues": [
+    {"code": "...", "problem": "...", "action": "remove|replace|keep"}
+  ],
+  "codes": [
+    {"code": "...", "system": "ICD-10-CM|CPT", "snippet": "...", "rationale": "..."}
+  ]
+}
+
+The codes array must be the final corrected set. If the draft is correct, return
+it unchanged with approved=true. If it is not correct, return the corrected set
+and approved=false."""
+
+
+def verifier_user(
+    prompt: str,
+    note: str,
+    history_json: str,
+    plan_json: str,
+    draft_raw: str,
+    feedback: str = "",
+) -> str:
+    text = (
+        "TASK PROMPT\n"
+        f"{prompt.strip()}\n\n"
+        "ENCOUNTER NOTE\n"
+        f"{note.strip()}\n\n"
+        "HISTORY FIXTURE\n"
+        f"{history_json.strip()}\n\n"
+        "PLANNER FINDINGS\n"
+        f"{plan_json.strip()}\n\n"
+        "CODER DRAFT\n"
+        f"{draft_raw.strip()}\n\n"
+    )
+    if feedback.strip():
+        text += f"PRIOR VERIFIER FEEDBACK\n{feedback.strip()}\n\n"
+    return text + "Produce the verifier JSON now."
+
+
 def coder_user(
     prompt: str,
     note: str,

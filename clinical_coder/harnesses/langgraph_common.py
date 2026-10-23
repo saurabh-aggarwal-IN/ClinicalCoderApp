@@ -16,8 +16,10 @@ from clinical_coder.harnesses.base import (
 from clinical_coder.harnesses.prompts import (
     CODER_SYSTEM,
     PLANNER_SYSTEM,
+    VERIFIER_SYSTEM,
     coder_user,
     planner_user,
+    verifier_user,
 )
 from clinical_coder.llm.budget import BudgetTracker
 from clinical_coder.llm.client import LLMGateway
@@ -51,6 +53,8 @@ class GraphState(TypedDict, total=False):
     feedback: str
     revisions: int
     issues: list[str]
+    approved: bool
+    needs_revision: bool
     usage: Usage
     warnings: list[str]
     model_actual: str | None
@@ -231,6 +235,103 @@ async def coder_node(state: GraphState) -> GraphState:
     }
 
 
+def _issue_text(item: Any) -> str:
+    if isinstance(item, dict):
+        code = item.get("code") or "?"
+        problem = item.get("problem") or item.get("reason") or "issue"
+        action = item.get("action") or "review"
+        return f"{code}: {problem} ({action})"
+    return str(item)
+
+
+async def verifier_node(state: GraphState) -> GraphState:
+    request = state["request"]
+    trace = state["trace"]
+    gateway = state["gateway"]
+    budget = state["budget"]
+    model = state["model"]
+    revisions = state.get("revisions", 0)
+
+    trace.turn_start(node="verifier", model=model, revision=revisions)
+    messages = [
+        {"role": "system", "content": VERIFIER_SYSTEM},
+        {
+            "role": "user",
+            "content": verifier_user(
+                request.prompt,
+                request.encounter_note,
+                history_json(request),
+                json.dumps(state.get("plan") or {}, indent=2, default=str)[:20_000],
+                state.get("draft_raw") or "",
+                state.get("feedback") or "",
+            ),
+        },
+    ]
+    response = await gateway.complete(
+        messages,
+        model=model,
+        temperature=0.0,
+        max_tokens=min(4_000, budget.limits.max_output_tokens),
+        request_id=_request_id(request, f"verifier-{revisions + 1}"),
+    )
+    usage = _merge_usage(state, response.usage)
+    warnings = list(state.get("warnings") or [])
+
+    codes: list[CodeEntry] = []
+    issues: list[str] = []
+    approved = False
+    parse_error: str | None = None
+    try:
+        parsed = extract_json_object(response.content)
+        if not isinstance(parsed, dict):
+            raise OutputFormatError("Verifier output is not a JSON object")
+        raw_issues = parsed.get("issues") or []
+        if isinstance(raw_issues, list):
+            issues = [_issue_text(item)[:500] for item in raw_issues]
+        approved = bool(parsed.get("approved")) and not issues
+        codes = parse_coding_output(json.dumps(parsed))
+    except OutputFormatError as exc:
+        parse_error = str(exc)
+        issues = [f"Verifier output could not be parsed: {exc}"]
+        warnings = _warnings(state, "Verifier output was not valid coding-output-v1 JSON.")
+
+    needs_revision = (not approved or parse_error is not None) and revisions < 1
+    if needs_revision:
+        feedback = "\n".join(issues) or "Repair the draft into valid coding-output-v1 JSON."
+        feedback = (
+            "The verifier rejected the draft. Fix every issue and return the "
+            "final coding-output-v1 JSON only.\n"
+            f"{feedback}"
+        )[:4_000]
+    else:
+        feedback = state.get("feedback") or ""
+
+    trace.message(response.content[:20_000], role="verifier", node="verifier")
+    trace.turn_end(
+        node="verifier",
+        approved=approved,
+        issues=len(issues),
+        needs_revision=needs_revision,
+    )
+    return {
+        "codes": codes,
+        "final_raw": response.content,
+        "approved": approved,
+        "issues": issues,
+        "needs_revision": needs_revision,
+        "feedback": feedback,
+        "revisions": revisions + (1 if needs_revision else 0),
+        "parse_error": parse_error,
+        "usage": usage,
+        "warnings": warnings,
+        "model_actual": response.model_actual,
+    }
+
+
+def verifier_route(state: GraphState) -> str:
+    return "coder" if state.get("needs_revision") else "__end__"
+
+
 class LangGraphHarness(BaseHarness):
     """Shared planner/coder execution for H2 and H3."""
 
@@ -278,6 +379,8 @@ class LangGraphHarness(BaseHarness):
             "feedback": "",
             "revisions": 0,
             "issues": [],
+            "approved": False,
+            "needs_revision": False,
             "usage": Usage(),
             "warnings": [],
             "model_actual": None,
