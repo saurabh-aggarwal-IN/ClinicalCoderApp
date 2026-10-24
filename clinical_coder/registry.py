@@ -17,7 +17,7 @@ def build_harness(cfg: Settings) -> BaseHarness:
         return LangGraphH3Harness(cfg)
     if not harness_id or harness_id in {"auto", "default"}:
         # The commit itself determines the harness implementation.
-        # Fallback hierarchy matches repo evolution: H3 -> H2 -> H1.
+        # Fallback hierarchy matches repo evolution: H3 (Multi-Agent Specialist) -> H2 (Planner+Verifier) -> H1 (Hermes).
         try:
             return LangGraphH3Harness(cfg)
         except Exception:

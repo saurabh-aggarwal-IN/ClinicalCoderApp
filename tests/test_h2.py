@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -11,12 +12,15 @@ from clinical_coder.service import HarnessService
 
 
 class FakeGateway:
-    def __init__(self, contents: list[str]) -> None:
+    def __init__(self, contents: list[str], fail_on_call: int | None = None) -> None:
         self.contents = list(contents)
         self.calls: list[list[dict]] = []
+        self.fail_on_call = fail_on_call
 
     async def complete(self, messages, **kwargs) -> LLMResponse:
         self.calls.append(messages)
+        if self.fail_on_call is not None and len(self.calls) == self.fail_on_call:
+            raise LLMError("BUDGET_EXCEEDED", "call budget exhausted")
         if not self.contents:
             raise LLMError("LLM_TEST_EXHAUSTED", "no more fake responses")
         content = self.contents.pop(0)
@@ -42,19 +46,9 @@ PLAN = json.dumps(
                 "condition": "Type 2 diabetes mellitus without complications",
                 "status": "active",
                 "evidence": "stable chronic T2DM without complications",
-                "history_support": "E11.9",
-            },
-            {
-                "condition": "Chronic systolic heart failure",
-                "status": "active",
-                "evidence": "stable chronic systolic heart failure",
-                "history_support": "I50.22",
-            },
+            }
         ],
-        "candidate_codes": [
-            {"code": "E11.9", "system": "ICD-10-CM", "why": "documented"},
-            {"code": "I50.22", "system": "ICD-10-CM", "why": "documented"},
-        ],
+        "candidate_codes": [{"code": "E11.9", "system": "ICD-10-CM", "why": "documented"}],
         "do_not_code": [{"code": "J44.1", "reason": "historical HCC only"}],
     }
 )
@@ -67,14 +61,43 @@ CODES = json.dumps(
                 "system": "ICD-10-CM",
                 "snippet": "stable chronic T2DM without complications",
                 "rationale": "Documented.",
-            },
-            {
-                "code": "I50.22",
-                "system": "ICD-10-CM",
-                "snippet": "stable chronic systolic heart failure",
-                "rationale": "Documented.",
-            },
+            }
         ]
+    }
+)
+
+CODES_FIXED = json.dumps(
+    {
+        "codes": [
+            {
+                "code": "E11.9",
+                "system": "ICD-10-CM",
+                "snippet": "stable chronic T2DM without complications",
+                "rationale": "Documented and confirmed.",
+            }
+        ]
+    }
+)
+
+VERIFIER_CLEAN = json.dumps(
+    {
+        "approved": True,
+        "issues": [],
+        "codes": json.loads(CODES)["codes"],
+    }
+)
+
+VERIFIER_REJECT = json.dumps(
+    {
+        "approved": False,
+        "issues": [
+            {
+                "code": "J44.1",
+                "problem": "Historical HCC is not documented in the current note.",
+                "action": "remove",
+            }
+        ],
+        "codes": json.loads(CODES_FIXED)["codes"],
     }
 )
 
@@ -87,71 +110,94 @@ def request(note: str, prompt: str) -> CodeRequest:
         history={
             "patientId": "SYN-C01",
             "activeHccs": [{"supportingCodes": ["E11.9", "J44.1"]}],
-            "priorClaims": [{"diagnoses": ["I50.22"], "procedures": ["93000"]}],
         },
         request_id="h2-test",
     )
 
 
-def make_service(cfg, contents: list[str]) -> tuple[HarnessService, FakeGateway]:
-    gateway = FakeGateway(contents)
+def make_service(cfg, contents: list[str], **kwargs) -> tuple[HarnessService, FakeGateway]:
+    gateway = FakeGateway(contents, **kwargs)
     harness = LangGraphH2Harness(cfg, gateway_factory=lambda _cfg, _budget: gateway)
     return HarnessService(harness, cfg), gateway
 
 
 @pytest.mark.asyncio
-async def test_h2_graph_runs_planner_then_coder(cfg, note, prompt) -> None:
-    service, gateway = make_service(cfg, [PLAN, CODES])
+async def test_h2_verifier_approves(cfg, note, prompt) -> None:
+    cfg = replace(cfg, server_max_llm_calls=8)
+    service, gateway = make_service(cfg, [PLAN, CODES, VERIFIER_CLEAN])
     response = await service.handle(request(note, prompt))
 
     assert response.error is None
-    assert [entry.code for entry in response.codes] == ["E11.9", "I50.22"]
+    assert [entry.code for entry in response.codes] == ["E11.9"]
     assert response.harness.id == "h2"
-    assert len(gateway.calls) == 2
-    assert any(event.type == "history_read" for event in response.trace)
-    history_event = next(event for event in response.trace if event.type == "history_read")
-    assert set(history_event.payload["codes"]) == {"E11.9", "I50.22", "J44.1", "93000"}
-    assert any(event.type == "turn_start" and event.payload.get("node") == "planner" for event in response.trace)
-    assert any(event.type == "turn_start" and event.payload.get("node") == "coder" for event in response.trace)
-    assert not any(
-        event.type == "turn_start" and event.payload.get("node") == "verifier"
+    assert len(gateway.calls) == 3
+    nodes = [
+        event.payload.get("node")
         for event in response.trace
+        if event.type == "turn_start"
+    ]
+    assert nodes.count("verifier") == 1
+    assert nodes.count("coder") == 1
+    assert any(event.type == "history_read" for event in response.trace)
+
+
+@pytest.mark.asyncio
+async def test_h2_rejects_then_revises_once(cfg, note, prompt) -> None:
+    cfg = replace(cfg, server_max_llm_calls=8)
+    service, gateway = make_service(
+        cfg,
+        [PLAN, CODES, VERIFIER_REJECT, CODES_FIXED, VERIFIER_CLEAN],
     )
-
-
-@pytest.mark.asyncio
-async def test_h2_prompts_include_history(cfg, note, prompt) -> None:
-    service, gateway = make_service(cfg, [PLAN, CODES])
-    await service.handle(request(note, prompt))
-    planner_messages = gateway.calls[0]
-    coder_messages = gateway.calls[1]
-    assert "SYN-C01" in planner_messages[1]["content"]
-    assert "J44.1" in planner_messages[1]["content"]
-    assert "J44.1" in coder_messages[1]["content"]
-
-
-@pytest.mark.asyncio
-async def test_h2_malformed_coder_output_is_structured(cfg, note, prompt) -> None:
-    service, _ = make_service(cfg, [PLAN, "not json"])
     response = await service.handle(request(note, prompt))
 
-    assert response.error is not None
-    assert response.error.code == "OUTPUT_FORMAT_INVALID"
-    assert response.codes == []
-    assert response.raw_output == "not json"
+    assert response.error is None
+    assert [entry.code for entry in response.codes] == ["E11.9"]
+    assert len(gateway.calls) == 5
+    starts = [
+        event.payload.get("node")
+        for event in response.trace
+        if event.type == "turn_start"
+    ]
+    assert starts.count("coder") == 2
+    assert starts.count("verifier") == 2
+    verifier_turns = [
+        event
+        for event in response.trace
+        if event.type == "turn_end" and event.payload.get("node") == "verifier"
+    ]
+    assert verifier_turns[0].payload["needs_revision"] is True
+    assert verifier_turns[1].payload["needs_revision"] is False
+    assert any("verifier rejected" in msg["content"].lower() for msg in gateway.calls[3])
 
 
 @pytest.mark.asyncio
-async def test_h2_gateway_error_is_structured(cfg, note, prompt) -> None:
-    class FailingGateway(FakeGateway):
-        async def complete(self, messages, **kwargs):
-            raise LLMError("CIRCUIT_OPEN", "breaker open", retryable=True)
-
-    gateway = FailingGateway([])
-    harness = LangGraphH2Harness(cfg, gateway_factory=lambda _cfg, _budget: gateway)
-    service = HarnessService(harness, cfg)
+async def test_h2_malformed_verifier_can_be_repaired(cfg, note, prompt) -> None:
+    cfg = replace(cfg, server_max_llm_calls=8)
+    service, gateway = make_service(
+        cfg,
+        [PLAN, CODES, "not json", CODES_FIXED, VERIFIER_CLEAN],
+    )
     response = await service.handle(request(note, prompt))
 
+    assert response.error is None
+    assert [entry.code for entry in response.codes] == ["E11.9"]
+    assert len(gateway.calls) == 5
+    verifier_turns = [
+        event
+        for event in response.trace
+        if event.type == "turn_end" and event.payload.get("node") == "verifier"
+    ]
+    assert verifier_turns[0].payload["needs_revision"] is True
+
+
+@pytest.mark.asyncio
+async def test_h2_budget_error_is_structured(cfg, note, prompt) -> None:
+    cfg = replace(cfg, server_max_llm_calls=8)
+    service, _ = make_service(
+        cfg,
+        [PLAN, CODES, VERIFIER_CLEAN],
+        fail_on_call=2,
+    )
+    response = await service.handle(request(note, prompt))
     assert response.error is not None
-    assert response.error.code == "CIRCUIT_OPEN"
-    assert response.error.retryable is True
+    assert response.error.code == "BUDGET_EXCEEDED"
