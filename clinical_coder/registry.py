@@ -8,11 +8,23 @@ from clinical_coder.settings import Settings
 
 
 def build_harness(cfg: Settings) -> BaseHarness:
-    harness_id = cfg.harness_id.strip().lower()
+    harness_id = (cfg.harness_id or "").strip().lower()
     if harness_id == "h1":
         return DirectHermesHarness(cfg)
     if harness_id == "h2":
         return LangGraphH2Harness(cfg)
     if harness_id == "h3":
         return LangGraphH3Harness(cfg)
-    raise RuntimeError(f"Unknown harness id {harness_id!r}; expected h1, h2, or h3")
+    if not harness_id or harness_id in {"auto", "default"}:
+        # The commit itself determines the harness implementation.
+        # Fallback hierarchy matches repo evolution: H3 -> H2 -> H1.
+        try:
+            return LangGraphH3Harness(cfg)
+        except Exception:
+            pass
+        try:
+            return LangGraphH2Harness(cfg)
+        except Exception:
+            pass
+        return DirectHermesHarness(cfg)
+    raise RuntimeError(f"Unknown harness id {harness_id!r}; expected h1, h2, h3, or auto")
