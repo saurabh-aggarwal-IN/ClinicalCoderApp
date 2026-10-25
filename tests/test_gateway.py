@@ -192,3 +192,56 @@ async def test_model_substitution_is_flagged(cfg) -> None:
     finally:
         await gw.aclose()
     assert "MODEL_SUBSTITUTED" in result.guardrail_flags
+
+
+@pytest.mark.asyncio
+async def test_extract_retry_delay_from_429_payloads() -> None:
+    # 1. Header
+    r_hdr = httpx.Response(429, headers={"Retry-After": "15"})
+    assert LLMGateway._extract_retry_delay(r_hdr) == 15.0
+
+    # 2. JSON with retry_after
+    r_json1 = httpx.Response(429, json={"error": {"message": "Rate limited", "retry_after": 22.5}})
+    assert LLMGateway._extract_retry_delay(r_json1) == 22.5
+
+    # 3. JSON with message regex cooldown
+    r_json2 = httpx.Response(
+        429,
+        json={"error": {"message": "All models exhausted: 1 route cooldown. Soonest reset ~29s."}},
+    )
+    assert LLMGateway._extract_retry_delay(r_json2) == 29.0
+
+    # 4. JSON with future retryAtMs
+    import time
+    future_ms = (time.time() + 18.0) * 1000.0
+    r_json3 = httpx.Response(429, json={"error": {"retryAtMs": future_ms}})
+    extracted = LLMGateway._extract_retry_delay(r_json3)
+    assert extracted is not None
+    assert 16.0 <= extracted <= 20.0
+
+
+@pytest.mark.asyncio
+async def test_retries_429_without_tripping_circuit_breaker(cfg) -> None:
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return httpx.Response(
+                429,
+                json={"error": {"message": "Rate limited. Soonest reset ~5s."}},
+            )
+        return completion()
+
+    # Allow 3 retries (4 attempts total)
+    gw = gateway(cfg, handler, retries=3)
+    try:
+        result = await gw.complete(MESSAGES, model="mock/model")
+    finally:
+        await gw.aclose()
+
+    assert result.content == '{"codes":[]}'
+    assert calls["n"] == 3
+    # Verify circuit breaker is still closed
+    assert gw.runtime.breaker.snapshot()["state"] == "closed"
+

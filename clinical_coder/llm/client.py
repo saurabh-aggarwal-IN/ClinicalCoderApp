@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
@@ -306,21 +307,29 @@ class LLMGateway:
             )
             if retryable:
                 retry_reasons.append(last_error.code)
-                await self.runtime.breaker.record_failure()
+                # For temporary 429 rate limit cooldowns, avoid recording circuit breaker failures
+                # on intermediate attempts so backoff has time to wait out the provider cooldown.
+                # Only record breaker failure on hard errors (5xx/timeouts) or when all retries are exhausted.
+                if response.status_code != 429 or attempts >= max_attempts:
+                    await self.runtime.breaker.record_failure()
                 self.budget.after_failed_attempt(estimated_input)
                 if attempts < max_attempts:
-                    await self._sleep_backoff(attempts, response.headers.get("Retry-After"))
+                    delay_s = self._extract_retry_delay(response)
+                    await self._sleep_backoff(attempts, delay_s)
                     continue
             raise last_error
 
         raise last_error or LLMError("LLM_UNKNOWN", "Model request failed")
 
-    async def _sleep_backoff(self, attempt: int, retry_after: str | None) -> None:
-        delay = self._retry_after_seconds(retry_after)
-        if delay is None:
+    async def _sleep_backoff(self, attempt: int, delay_s: float | None) -> None:
+        if delay_s is None:
             base = min(8.0, 0.5 * (2 ** (attempt - 1)))
             delay = base + random.uniform(0.0, base * 0.25)
-        delay = min(30.0, max(0.0, delay))
+        else:
+            # When the model provider or router supplies an explicit reset/cooldown timestamp,
+            # sleep for that duration plus a small jitter buffer (1.0-2.5s) to avoid race conditions.
+            delay = delay_s + random.uniform(1.0, 2.5)
+        delay = min(60.0, max(0.5, delay))
         remaining = self.budget.limits.max_wall_seconds - self.budget.elapsed_s()
         if remaining <= 0:
             raise LLMError(
@@ -330,6 +339,58 @@ class LLMGateway:
             )
         await asyncio.sleep(min(delay, remaining))
         self.budget.check_wall()
+
+    @classmethod
+    def _extract_retry_delay(cls, response: httpx.Response) -> float | None:
+        # 1. Standard Retry-After header
+        header_val = response.headers.get("Retry-After")
+        delay = cls._retry_after_seconds(header_val)
+        if delay is not None:
+            return delay
+
+        # 2. Body inspection
+        try:
+            data = response.json()
+        except Exception:
+            data = None
+
+        if isinstance(data, dict):
+            err = data.get("error") if isinstance(data.get("error"), dict) else data
+
+            # Epoch milliseconds retryAtMs (e.g. {"retryAtMs": 1792911522446})
+            retry_at_ms = err.get("retryAtMs") or data.get("retryAtMs")
+            if isinstance(retry_at_ms, (int, float)) and retry_at_ms > 0:
+                target_epoch = retry_at_ms / 1000.0 if retry_at_ms > 1e11 else float(retry_at_ms)
+                diff = target_epoch - time.time()
+                return max(1.0, diff)
+
+            # Explicit retry_after or retry_after_s
+            for key in ("retry_after", "retry_after_s", "retryAfter"):
+                val = err.get(key) or data.get(key)
+                if val is not None:
+                    try:
+                        return max(1.0, float(val))
+                    except (ValueError, TypeError):
+                        pass
+
+            # retry_after_ms
+            retry_ms = err.get("retry_after_ms") or data.get("retry_after_ms")
+            if isinstance(retry_ms, (int, float)) and retry_ms > 0:
+                return max(1.0, retry_ms / 1000.0)
+
+            # Text message regex search (e.g. "Soonest reset ~29s" or "retry after 15 seconds")
+            msg = str(err.get("message") or "")
+            match = re.search(r"(?:reset|cooldown|retry.*?after)\s*~?\s*(\d+(?:\.\d+)?)\s*s", msg, re.IGNORECASE)
+            if match:
+                return max(1.0, float(match.group(1)))
+
+        # 3. Fallback regex on raw text preview
+        if response.text:
+            match = re.search(r"(?:reset|cooldown|retry.*?after)\s*~?\s*(\d+(?:\.\d+)?)\s*s", response.text[:500], re.IGNORECASE)
+            if match:
+                return max(1.0, float(match.group(1)))
+
+        return None
 
     @staticmethod
     def _retry_after_seconds(value: str | None) -> float | None:
