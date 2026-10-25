@@ -20,20 +20,29 @@ logger = logging.getLogger("clinical_coder.worker")
 class RedisWorker:
     """Consume coding jobs from a Redis Stream and publish contract responses."""
 
-    def __init__(self) -> None:
-        self.cfg = settings()
-        self.service = HarnessService(build_harness(self.cfg), self.cfg)
+    def __init__(
+        self,
+        cfg: Settings | None = None,
+        service: HarnessService | None = None,
+        redis_client: Any = None,
+    ) -> None:
+        self.cfg = cfg or settings()
+        self.service = service or HarnessService(build_harness(self.cfg), self.cfg)
         self.consumer = (
             f"{self.cfg.harness_slot}-{socket.gethostname()}-{os.getpid()}"
         )
         self._stop = asyncio.Event()
-        self._redis: Any = None
+        self._redis: Any = redis_client
 
     async def run(self) -> None:
         from redis.asyncio import Redis
         from redis.exceptions import ResponseError
 
-        self._redis = Redis.from_url(self.cfg.redis_url, decode_responses=True)
+        owns_redis = False
+        if self._redis is None:
+            self._redis = Redis.from_url(self.cfg.redis_url, decode_responses=True)
+            owns_redis = True
+
         try:
             try:
                 await self._redis.xgroup_create(
@@ -46,11 +55,12 @@ class RedisWorker:
                 if "BUSYGROUP" not in str(exc):
                     raise
             logger.info(
-                "worker ready slot=%s stream=%s group=%s consumer=%s",
+                "worker ready slot=%s stream=%s group=%s consumer=%s concurrency=%d",
                 self.cfg.harness_slot,
                 self.cfg.stream_jobs,
                 self.cfg.consumer_group,
                 self.consumer,
+                self.cfg.worker_concurrency,
             )
             heartbeat = asyncio.create_task(self._heartbeat())
             try:
@@ -62,30 +72,74 @@ class RedisWorker:
                 except asyncio.CancelledError:
                     pass
         finally:
-            await self._redis.aclose()
+            if owns_redis and self._redis is not None:
+                await self._redis.aclose()
 
     async def _loop(self) -> None:
-        while not self._stop.is_set():
-            await self._reclaim()
-            try:
-                batches = await self._redis.xreadgroup(
-                    self.cfg.consumer_group,
-                    self.consumer,
-                    {self.cfg.stream_jobs: ">"},
-                    count=1,
-                    block=5_000,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - transient Redis errors
-                logger.warning("xreadgroup failed: %s", type(exc).__name__)
-                await asyncio.sleep(2)
-                continue
-            for _stream, messages in batches or []:
-                for message_id, fields in messages:
-                    await self._handle(message_id, fields)
+        concurrency = max(1, self.cfg.worker_concurrency)
+        logger.info(
+            "worker loop running slot=%s concurrency=%d",
+            self.cfg.harness_slot,
+            concurrency,
+        )
+        active_tasks: set[asyncio.Task[None]] = set()
 
-    async def _reclaim(self) -> None:
+        try:
+            while not self._stop.is_set():
+                active_tasks = {t for t in active_tasks if not t.done()}
+
+                if len(active_tasks) >= concurrency:
+                    done, _pending = await asyncio.wait(
+                        active_tasks, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    active_tasks.difference_update(done)
+
+                if self._stop.is_set():
+                    break
+
+                available = concurrency - len(active_tasks)
+                if available <= 0:
+                    continue
+
+                reclaimed = await self._reclaim(count=available)
+                for message_id, fields in reclaimed:
+                    task = asyncio.create_task(self._handle(message_id, fields))
+                    active_tasks.add(task)
+                    available -= 1
+                    if available <= 0:
+                        break
+
+                if available <= 0 or self._stop.is_set():
+                    continue
+
+                try:
+                    batches = await self._redis.xreadgroup(
+                        self.cfg.consumer_group,
+                        self.consumer,
+                        {self.cfg.stream_jobs: ">"},
+                        count=available,
+                        block=2_000,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - transient Redis errors
+                    logger.warning("xreadgroup failed: %s", type(exc).__name__)
+                    await asyncio.sleep(2)
+                    continue
+
+                for _stream, messages in batches or []:
+                    for message_id, fields in messages:
+                        task = asyncio.create_task(self._handle(message_id, fields))
+                        active_tasks.add(task)
+        finally:
+            if active_tasks:
+                logger.info(
+                    "worker loop terminating; waiting for %d active tasks",
+                    len(active_tasks),
+                )
+                await asyncio.gather(*active_tasks, return_exceptions=True)
+
+    async def _reclaim(self, count: int = 5) -> list[tuple[str, dict[str, Any]]]:
         try:
             _cursor, messages, _deleted = await self._redis.xautoclaim(
                 self.cfg.stream_jobs,
@@ -93,14 +147,16 @@ class RedisWorker:
                 self.consumer,
                 min_idle_time=60_000,
                 start_id="0-0",
-                count=5,
+                count=count,
             )
         except Exception:  # noqa: BLE001 - older Redis or empty group
-            return
+            return []
+        reclaimed: list[tuple[str, dict[str, Any]]] = []
         for message_id, fields in messages or []:
             if fields:
                 logger.info("reclaimed job message=%s", message_id)
-                await self._handle(message_id, fields)
+                reclaimed.append((message_id, fields))
+        return reclaimed
 
     async def _handle(self, message_id: str, fields: dict[str, Any]) -> None:
         raw = fields.get("job")
@@ -177,6 +233,7 @@ class RedisWorker:
                         "slot": self.cfg.harness_slot,
                         "consumer": self.consumer,
                         "comparison_id": self.cfg.comparison_id,
+                        "concurrency": str(self.cfg.worker_concurrency),
                         "pid": os.getpid(),
                     },
                 )

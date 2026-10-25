@@ -153,7 +153,7 @@ def settings() -> Settings:
         stream_jobs=os.getenv("STREAM_JOBS", "cc:jobs:local:h1"),
         stream_results=os.getenv("STREAM_RESULTS", "cc:results:local"),
         consumer_group=os.getenv("CONSUMER_GROUP", "workers"),
-        worker_concurrency=_int("WORKER_CONCURRENCY", 1, 1),
+        worker_concurrency=_int("WORKER_CONCURRENCY", 4, 1),
         worker_heartbeat_s=_int("WORKER_HEARTBEAT_S", 5, 1),
         disclaimer=(
             "Synthetic clinical coding evaluation only. Not clinical advice, "
