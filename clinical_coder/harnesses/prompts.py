@@ -148,7 +148,7 @@ Return ONLY a JSON object conforming to this schema, with no markdown fences:
   "entities": [
     {
       "term": "...",
-      "entity_type": "ICD-10" or "CPT",
+      "entity_type": "ICD-10|CPT",
       "snippet": "verbatim text from note",
       "context": "..."
     }
@@ -273,15 +273,15 @@ Rules:
 2. Reject any code where the only support is a historical HCC, prior claim, or resolved condition not active in the current note.
 3. Reject any E/M codes (99202-99499).
 4. For any code with action "replace", provide a clear "better_context_or_term" and "reason" explaining what the specialist agent should code instead.
-5. All approved codes must be included in the approved_codes list.
+5. CRITICAL: For every code where action is "approve", you MUST include that code in the "approved_codes" list with its verbatim snippet and rationale. Do not leave "approved_codes" empty if you approved any code.
 
 Return ONLY a JSON object conforming to this schema, with no markdown fences:
 {
   "decisions": [
     {
       "code": "...",
-      "system": "ICD-10-CM" or "CPT",
-      "action": "approve" or "delete" or "replace",
+      "system": "ICD-10-CM|CPT",
+      "action": "approve|delete|replace",
       "reason": "...",
       "better_context_or_term": "..."
     }
@@ -289,7 +289,7 @@ Return ONLY a JSON object conforming to this schema, with no markdown fences:
   "approved_codes": [
     {
       "code": "...",
-      "system": "ICD-10-CM" or "CPT",
+      "system": "ICD-10-CM|CPT",
       "snippet": "...",
       "rationale": "..."
     }
