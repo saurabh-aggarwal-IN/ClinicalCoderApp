@@ -492,6 +492,15 @@ async def verifier_node(state: H3GraphState) -> H3GraphState:
             if decisions_by_code.get(code_item.code) == "approve":
                 approved_entries.append(code_item.to_code_entry())
 
+    # Resilient fallback: If no codes explicitly approved but candidate codes exist, keep non-deleted codes
+    if not approved_entries:
+        for code_item in icd10_output.codes:
+            if decisions_by_code.get(code_item.code) != "delete":
+                approved_entries.append(code_item.to_code_entry())
+        for code_item in cpt_output.codes:
+            if decisions_by_code.get(code_item.code) != "delete":
+                approved_entries.append(code_item.to_code_entry())
+
     has_replacements = bool(replacement_requests_icd10 or replacement_requests_cpt)
     can_revise = revisions < 1
     needs_revision = has_replacements and can_revise
